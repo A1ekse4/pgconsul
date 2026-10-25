@@ -356,6 +356,13 @@ class ZkClient(object):
             return None
         return min(child.split('__')[-1] for child in children)
 
+    def read_lock_contenders(self, path: str, identifier: str) -> List[str]:
+        """Read contenders through a temporary lock recipe without acquiring it."""
+        recipe = self._client.Lock(self._resolve_path(path), identifier)
+        # Kazoo contenders() otherwise calls ensure_path(), even for a read.
+        recipe.assured_path = True
+        return LockHandle(recipe).contenders()
+
     def write(self, path, data, makepath=True):
         """Set-or-create write via kazoo_write_zk_value.
         Returns True. Raises ZkSessionExpiredError, ZkClientError on failure.

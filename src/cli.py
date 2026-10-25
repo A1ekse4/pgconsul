@@ -17,6 +17,8 @@ from .zk import create_zk, Zookeeper, ZookeeperException
 from . import helpers
 from . import utils
 from .exceptions import SwitchoverException, FailoverException, ResetException
+from . import info as info_report
+from . import info_output
 
 
 class ParseHosts(argparse.Action):
@@ -244,56 +246,16 @@ def show_info(opts, conf):
     info = _show_info(opts, conf)
     if info is not None:
         if opts.json:
-            print(json.dumps(info, sort_keys=True, indent=4))
+            document = info if opts.short else info_output.format_full(info)
+            print(json.dumps(document, sort_keys=False, indent=4))
+        elif not opts.short:
+            print(info_output.render_full(info))
         else:
-            print(yaml.dump(info, sort_keys=True, indent=4))
+            print(yaml.dump(info, sort_keys=False, indent=4))
 
 
 def _show_info(opts, conf):
-    with create_zk(config=conf) as zk:
-        zk_state = zk.get_state()
-        zk_state['primary'] = zk_state.pop('lock_holder')  # rename field name to avoid misunderstandings
-        maintenance_path = zk.MAINTENANCE_PATH
-        last_failover_path = zk.LAST_FAILOVER_TIME_PATH
-    if zk_state[maintenance_path]['status'] is None:
-        zk_state[maintenance_path] = None
-
-    if opts.short:
-        return {
-            'alive': zk_state['alive'],
-            'primary': zk_state['primary'],
-            'last_failover_time': zk_state[last_failover_path],
-            'maintenance': zk_state[maintenance_path],
-            'replics_info': _short_replica_infos(zk_state['replics_info']),
-        }
-
-    db_state = _get_db_state(conf)
-    return {**db_state, **zk_state}
-
-
-def _get_db_state(conf):
-    fname = '%s/.pgconsul_db_state.cache' % conf.get('global', 'working_dir')
-    try:
-        with open(fname, 'r') as fobj:
-            return json.loads(fobj.read())
-    except Exception:
-        logging.info("Can't load pgconsul status from %s, skipping", fname)
-        return dict()
-
-
-def _short_replica_infos(replics):
-    ret: dict[str, str] = {}
-    if replics is None:
-        return ret
-    for replica in replics:
-        ret[replica['client_hostname']] = ', '.join(
-            [
-                replica['state'],
-                'sync_state {0}'.format(replica['sync_state']),
-                'replay_lag_msec {0}'.format(replica['replay_lag_msec']),
-            ]
-        )
-    return ret
+    return info_report.collect_info(conf, short=opts.short)
 
 
 def parse_args():
@@ -374,7 +336,7 @@ def parse_args():
     info_arg.add_argument(
         '-s',
         '--short',
-        help='short output from zookeeper',
+        help='short output',
         action='store_true',
         default=False,
     )

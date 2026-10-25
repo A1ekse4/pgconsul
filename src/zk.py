@@ -88,13 +88,14 @@ class Zookeeper(object):
     SSN_VALUE_PATH = f'{SSN_PATH}/value'
     SSN_DATE_PATH = f'{SSN_PATH}/last_update'
 
-    def __init__(self, zk_client: ZkClient, config: ZookeeperConfig):
+    def __init__(self, zk_client: ZkClient, config: ZookeeperConfig, init_lock: bool = True):
         self.config = config
         self._locks: dict[str, LockHandle] = {}
         self._lockpath = self.config.path_prefix + self.PRIMARY_LOCK_PATH
         self._zk_client = zk_client
         self._zk_client.set_state_listener(self._listener)
-        self._init_lock(self.PRIMARY_LOCK_PATH)
+        if init_lock:
+            self._init_lock(self.PRIMARY_LOCK_PATH)
 
     def _drop_all_locks(self) -> None:
         """Release all held locks, swallow errors, clear the registry."""
@@ -296,7 +297,7 @@ class Zookeeper(object):
                 raise ZookeeperException(e)
             return None
 
-    def get_state(self):
+    def get_state(self, read_only=False):
         """Get current zk state (if possible)"""
         data = {'alive': self.is_alive()}
         if not data['alive']:
@@ -305,11 +306,11 @@ class Zookeeper(object):
         data[self.LAST_FAILOVER_TIME_PATH] = self.get(self.LAST_FAILOVER_TIME_PATH, preproc=float)
         data[self.LAST_SWITCHOVER_TIME_PATH] = self.get(self.LAST_SWITCHOVER_TIME_PATH, preproc=float)
         data[self.FAILOVER_STATE_PATH] = self.get(self.FAILOVER_STATE_PATH)
-        data[self.FAILOVER_MUST_BE_RESET] = self.exists_path(self.FAILOVER_MUST_BE_RESET)
+        data[self.FAILOVER_MUST_BE_RESET] = self.exists_path(self.FAILOVER_MUST_BE_RESET, catch_except=False) if read_only else self.exists_path(self.FAILOVER_MUST_BE_RESET)
         data[self.CURRENT_PROMOTING_HOST] = self.get(self.CURRENT_PROMOTING_HOST)
         data['lock_version'] = self._zk_client.lock_version(self._lockpath)
-        data['lock_holder'] = self.get_current_lock_holder()
-        data['single_node'] = self.is_single_node()
+        data['lock_holder'] = self.get_current_lock_holder(catch_except=False, read_only=True) if read_only else self.get_current_lock_holder()
+        data['single_node'] = self.exists_path(self.SINGLE_NODE_PATH, catch_except=False) if read_only else self.is_single_node()
         data[self.TIMELINE_INFO_PATH] = self.get(self.TIMELINE_INFO_PATH, preproc=int)
         data[self.SWITCHOVER_ROOT_PATH] = self.get(self.SWITCHOVER_PRIMARY_PATH, preproc=json.loads)
         data[self.SWITCHOVER_CANDIDATE] = self.get(self.SWITCHOVER_CANDIDATE)
@@ -320,16 +321,39 @@ class Zookeeper(object):
             'ts': self.get(self.MAINTENANCE_TIME_PATH),
         }
         data[self.LAST_PRIMARY_PATH] = self.get(self.LAST_PRIMARY_PATH)
-        data['synchronous_standby_names'] = self._get_ssn_info()
+        data['synchronous_standby_names'] = self._get_ssn_info(catch_except=False) if read_only else self._get_ssn_info()
 
         # Final liveness check: connection may have dropped during the reads above.
         if not self.is_alive():
             raise ZookeeperException("Zookeeper connection is unavailable now")
         return data
 
-    def _get_ssn_info(self) -> dict:
+    def get_info_state(self, hostname, publish=None):
+        data = self.get_state(read_only=True)
+        if publish:
+            publish(data)
+        try:
+            if self.exists_path(self.MEMBERS_PATH, catch_except=False):
+                members = self.get_members(catch_except=False)
+                if members is not None:
+                    data['info_members'] = members
+                    data['info_alive_hosts'] = [host for host in members if self.get_current_lock_holder(
+                        self.get_host_alive_lock_path(host), catch_except=False, read_only=True) is not None]
+        except (ZookeeperException, ZkClientError, ValueError):
+            logging.info('Cannot read diagnostic ZK membership')
+        if publish:
+            publish(data)
+        try:
+            data['info_host_replics_info'] = self.get(self._get_host_replics_info_path(hostname), preproc=json.loads)
+        except (ZookeeperException, ZkClientError, ValueError):
+            logging.info('Cannot read diagnostic ZK host publication')
+        if publish:
+            publish(data)
+        return data
+
+    def _get_ssn_info(self, catch_except=True) -> dict:
         ssn_info: dict = {}
-        all_hosts = self.get_children(self.MEMBERS_PATH, catch_except=True)
+        all_hosts = self.get_children(self.MEMBERS_PATH, catch_except=catch_except)
         if not all_hosts:
             return ssn_info
         for host in all_hosts:
@@ -385,9 +409,17 @@ class Zookeeper(object):
                 raise e
         return []
 
-    def get_current_lock_holder(self, name=None, catch_except=True):
+    def get_current_lock_holder(self, name=None, catch_except=True, read_only=False):
         """Get hostname of lock holder"""
         name = name or self.PRIMARY_LOCK_PATH
+        if read_only:
+            try:
+                contenders = self._zk_client.read_lock_contenders(name, self._get_lock_contender_name())
+            except ZkNoNodeError:
+                return None
+            except ZkClientError as error:
+                raise ZookeeperException(error) from error
+            return contenders[0] if contenders else None
         lock_contenders = self.get_lock_contenders(name, catch_except)
         if len(lock_contenders) > 0:
             return lock_contenders[0]
@@ -960,7 +992,7 @@ class Zookeeper(object):
         return alive_hosts
 
 
-def create_zk(config: RawConfigParser, lock_contender_name=None, allow_disconnected=False) -> Zookeeper:
+def create_zk(config: RawConfigParser, lock_contender_name=None, allow_disconnected=False, init_lock=True) -> Zookeeper:
     """Factory: build and connect a Zookeeper instance from config."""
     prefix = config.get('global', 'zk_lockpath_prefix')
     zk_config = ZookeeperConfig(
@@ -983,4 +1015,5 @@ def create_zk(config: RawConfigParser, lock_contender_name=None, allow_disconnec
     return Zookeeper(
         zk_client=zk_client,
         config=zk_config,
+        init_lock=init_lock,
     )
