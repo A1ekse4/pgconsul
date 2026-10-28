@@ -719,7 +719,7 @@ Feature: Check pgconsul-util features
         Then command exit with return code "0"
         And command result contains following output
         """
-        alive: true
+        db: available
         """
         When we run following command on host "postgresql1"
         """
@@ -728,13 +728,8 @@ Feature: Check pgconsul-util features
         Then command exit with return code "0"
         And command result contains following output
         """
-        {
-            "alive": true,
-            "last_failover_time": null,
-            "maintenance": null,
-            "primary": "pgconsul_postgresql1_1.pgconsul_pgconsul_net",
-            "replics_info": {}
-        }
+        "host": "pgconsul_postgresql1_1.pgconsul_pgconsul_net",
+            "role": "primary",
         """
 
 

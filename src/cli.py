@@ -5,18 +5,27 @@ Various utility functions:
     - Scheduled switchover
 """
 import argparse
+import contextlib
 import functools
 import json
 import yaml
 import socket
 import sys
 import logging
+import time
+from datetime import datetime, timezone
+
+import psycopg2
+from psycopg2.extensions import parse_dsn
 
 from . import read_config, init_logging
 from .zk import create_zk, Zookeeper, ZookeeperException
 from . import helpers
 from . import utils
 from .exceptions import SwitchoverException, FailoverException, ResetException
+from .info_output import INFO_QUERIES, REPLICA_FIELD_ORDER, format_info
+from .pg import wait_async_operation
+from .zk_client import ZkClientError
 
 
 class ParseHosts(argparse.Action):
@@ -243,56 +252,185 @@ def show_info(opts, conf):
     info = _show_info(opts, conf)
     if info is not None:
         if opts.json:
-            print(json.dumps(info, sort_keys=True, indent=4))
+            print(json.dumps(info, sort_keys=False, indent=4))
         else:
-            print(yaml.dump(info, sort_keys=True, indent=4))
+            print(yaml.safe_dump(info, sort_keys=False, indent=4, width=200))
 
 
 def _show_info(opts, conf):
-    with create_zk(config=conf) as zk:
-        zk_state = zk.get_state()
-        zk_state['primary'] = zk_state.pop('lock_holder')  # rename field name to avoid misunderstandings
-        maintenance_path = zk.MAINTENANCE_PATH
-        last_failover_path = zk.LAST_FAILOVER_TIME_PATH
-    if zk_state[maintenance_path]['status'] is None:
-        zk_state[maintenance_path] = None
-
+    try:
+        hostname = helpers.get_hostname()
+    except OSError:
+        hostname = socket.gethostname()
+    zk_state = None
+    try:
+        with create_zk(config=conf, allow_disconnected=True) as zk:
+            zk_state = zk.get_state()
+    except (ZookeeperException, ZkClientError, ValueError):
+        logging.info('ZK info source is unavailable')
+    sql = _get_info_db_state(conf)
+    status = _get_db_state(conf, 'pgconsul.status') or {}
+    sources = [('db', sql if sql.get('available') else None), ('zk', zk_state),
+               ('zk_cache', status.get('zk_state')), ('status_db_cache', status.get('db_state')),
+               ('db_cache', _get_db_state(conf))]
+    availability = {name: 'available' if isinstance(raw, dict) else 'unavailable' for name, raw in sources}
+    if not sql.get('available') and any(availability[name] == 'available' for name in ('db_cache', 'status_db_cache')):
+        availability['db'] = 'only cache'
+    values, origins = _merge_info(sources, hostname)
+    role = values.get('role')
+    if role == 'primary':
+        values['primary_fqdn'], origins['primary_fqdn'] = None, None
     if opts.short:
-        return {
-            'alive': zk_state['alive'],
-            'primary': zk_state['primary'],
-            'last_failover_time': zk_state[last_failover_path],
-            'maintenance': zk_state[maintenance_path],
-            'replics_info': _short_replica_infos(zk_state['replics_info']),
-        }
+        role_fields = {
+            'primary': ('replication_state',),
+            'replica': ('streaming', 'sync_state', 'replay_lag_msec'),
+        }.get(role, ())
+        fields = ('role', 'primary', 'last_failover_time', 'maintenance', *role_fields)
+        result = {**availability, 'host': hostname, **{key: values.get(key) for key in fields},
+                  'replics_info': _short_replica_infos(values.get('replics_info'))}
+        if role != 'primary':
+            result['primary_fqdn'] = values.get('primary_fqdn')
+        return format_info(result)
+    return format_info({**availability, 'host': hostname,
+                        **{key: {'value': value, 'source': origins.get(key)} for key, value in values.items()}})
 
-    db_state = _get_db_state(conf)
-    return {**db_state, **zk_state}
+
+def _merge_info(sources, hostname):
+    values: dict = dict.fromkeys(('role', 'primary', 'primary_fqdn', 'replics_info', 'maintenance', 'replication_state'))
+    origins: dict = {}
+    for name, raw in sources:
+        if not isinstance(raw, dict):
+            continue
+        for key, value in _info_values(raw, name, hostname).items():
+            if key not in origins:
+                values[key], origins[key] = value, name
+    changes = [(values[key], key) for key in ('last_failover_time', 'last_switchover_time') if values.get(key)]
+    if changes:
+        stamp, key = max(changes, key=lambda item: datetime.fromisoformat(item[0].replace('Z', '+00:00')))
+        values['last_change'] = f'{"failover" if key == "last_failover_time" else "switchover"} at {stamp}'
+        origins['last_change'] = origins[key]
+    return values, origins
 
 
-def _get_db_state(conf):
-    fname = '%s/.pgconsul_db_state.cache' % conf.get('global', 'working_dir')
+def _get_db_state(conf, filename='.pgconsul_db_state.cache'):
+    fname = '%s/%s' % (conf.get('global', 'working_dir'), filename)
     try:
         with open(fname, 'r') as fobj:
-            return json.loads(fobj.read())
-    except Exception:
+            value = json.load(fobj, parse_constant=lambda _: None)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
         logging.info("Can't load pgconsul status from %s, skipping", fname)
-        return dict()
+        return None
+
+
+def _get_info_db_state(conf):
+    data: dict = {'available': False}
+    try:
+        parameters = parse_dsn(conf.get('global', 'local_conn_string'))
+        parameters.update(application_name='pgconsul-util-info', connect_timeout='2')
+        parameters['options'] = (parameters.get('options', '') + ' -c statement_timeout=2000').strip()
+        deadline = time.monotonic() + 5
+        # shortcut: client timeouts do not bound DNS; use process isolation if a hard CLI deadline is required.
+        with contextlib.closing(psycopg2.connect(async_=True, **parameters)) as connection:
+            wait_async_operation(connection, deadline)
+            data['available'] = True
+            for name, query in INFO_QUERIES:
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute(query)
+                        wait_async_operation(connection, deadline)
+                        columns = [column[0] for column in cursor.description]
+                        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                    data[name] = rows if name == 'replics_info' else rows[0] if rows else None
+                except psycopg2.DatabaseError as error:
+                    if isinstance(error, psycopg2.OperationalError) and (connection.closed or not getattr(error, 'pgcode', None)):
+                        raise
+                    logging.info('Cannot read SQL info field %s: %s', name, type(error).__name__)
+    except (psycopg2.Error, ValueError, TimeoutError) as error:
+        data['available'] = False
+        logging.info('Cannot read local SQL info: %s', type(error).__name__)
+    if 'role' in data:
+        recovery = (data['role'] or {}).get('recovery')
+        data['role'] = ('replica' if recovery else 'primary') if isinstance(recovery, bool) else None
+    if 'replication_state' in data:
+        state = (data['replication_state'] or {}).get('synchronous_standby_names')
+        data['replication_state'] = ('sync', state) if state else ('async', None) if state == '' else None
+    return data
+
+
+def _info_values(raw, source, hostname):
+    values = {key: value for key, value in raw.items() if not key.startswith('info_') and key != 'available'}
+    if 'role' in values and values['role'] not in ('primary', 'replica'):
+        values['role'] = None
+    if source.startswith('zk'):
+        if 'alive' in values:
+            values['zk_alive'] = values['alive']
+        if 'lock_holder' in values:
+            values['primary'] = values.pop('lock_holder')
+        app_name = helpers.app_name_from_fqdn(hostname)
+        for replica in raw.get('replics_info') or []:
+            if isinstance(replica, dict) and (replica.get('application_name') == app_name or replica.get('client_hostname') == hostname):
+                values.update({key: replica[key] for key in ('sync_state', 'replay_lag_msec') if key in replica})
+                break
+        if 'maintenance' in values:
+            maintenance = values['maintenance']
+            values['maintenance'] = ('on' if maintenance['status'] == 'enable' else 'off') if isinstance(maintenance, dict) and 'status' in maintenance else None
+        for key in ('last_failover_time', 'last_switchover_time'):
+            if key in values:
+                values[key] = _info_timestamp(values[key])
+        ssn = raw.get('synchronous_standby_names')
+        if isinstance(ssn, dict):
+            values['synchronous_standby_names'] = {host: [pair[0], _info_timestamp(pair[1])]
+                                                  if isinstance(pair, (list, tuple)) and len(pair) == 2 else pair for host, pair in ssn.items()}
+    else:
+        if 'opened' in values:
+            opened = values.pop('opened')
+            values['pooler'] = 'opened' if opened is True else 'closed' if opened is False else None
+        state = raw.get('replication_state')
+        if isinstance(state, (list, tuple)) and len(state) == 2:
+            values['replication_state'] = f'sync, {state[1]}' if state[0] == 'sync' else 'async'
+        receiver = raw.get('wal_receiver')
+        if isinstance(receiver, dict):
+            values['wal_receiver'] = {key: value for key, value in receiver.items() if key != 'conninfo'}
+            values['wal_receiver']['last_msg_receipt_time_msec'] = _info_timestamp(receiver.get('last_msg_receipt_time_msec') or None, milliseconds=True)
+            if 'sender_host' in receiver:
+                values['primary_fqdn'] = receiver['sender_host']
+        if raw.get('role') == 'replica' and 'wal_receiver' in raw:
+            values['streaming'] = isinstance(receiver, dict) and receiver.get('status') == 'streaming'
+    rows = values.get('replics_info')
+    if isinstance(rows, list):
+        rows = [row.copy() for row in rows if isinstance(row, dict)]
+        for row in rows:
+            for key in ('backend_start_ts', 'reply_time_ms'):
+                if key in row:
+                    row[key] = _info_timestamp(row[key], milliseconds=key == 'reply_time_ms')
+        values['replics_info'] = [{key: row[key] for key in (*REPLICA_FIELD_ORDER, *row) if key in row} for row in rows]
+        values['hosts_streaming'] = sum(row['state'] == 'streaming' for row in rows) if all(row.get('state') is not None for row in rows) else None
+    return values
+
+
+def _info_timestamp(value, milliseconds=False):
+    try:
+        if isinstance(value, bool):
+            return None
+        seconds = int(float(value) / (1000 if milliseconds else 1))
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace('+00:00', 'Z')
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 def _short_replica_infos(replics):
-    ret: dict[str, str] = {}
     if replics is None:
-        return ret
+        return None
+    rows = []
     for replica in replics:
-        ret[replica['client_hostname']] = ', '.join(
-            [
-                replica['state'],
-                'sync_state {0}'.format(replica['sync_state']),
-                'replay_lag_msec {0}'.format(replica['replay_lag_msec']),
-            ]
-        )
-    return ret
+        state = replica.get('state') or 'unknown'
+        sync_state = replica.get('sync_state') or 'unknown'
+        lag = replica.get('replay_lag_msec')
+        info = f'{state}, sync_state {sync_state}, replay_lag_msec {lag if lag is not None else "unknown"}'
+        rows.append({'host': replica.get('client_hostname'), 'info': info})
+    names = [row['host'] for row in rows]
+    return {row['host']: row['info'] for row in rows} if rows and all(names) and len(names) == len(set(names)) else rows
 
 
 def parse_args():
@@ -373,7 +511,7 @@ def parse_args():
     info_arg.add_argument(
         '-s',
         '--short',
-        help='short output from zookeeper',
+        help='short output',
         action='store_true',
         default=False,
     )
